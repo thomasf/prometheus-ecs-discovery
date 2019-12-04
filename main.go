@@ -32,29 +32,133 @@ import (
 	"github.com/go-yaml/yaml"
 )
 
-type labels struct {
-	TaskArn       string `yaml:"task_arn"`
-	TaskName      string `yaml:"task_name"`
-	JobName       string `yaml:"job,omitempty"`
-	TaskRevision  string `yaml:"task_revision"`
-	TaskGroup     string `yaml:"task_group"`
-	ClusterArn    string `yaml:"cluster_arn"`
-	ContainerName string `yaml:"container_name"`
-	ContainerArn  string `yaml:"container_arn"`
-	DockerImage   string `yaml:"docker_image"`
-	MetricsPath   string `yaml:"__metrics_path__,omitempty"`
+type Config struct {
+	Cluster             string
+	Outfile             string
+	Interval            time.Duration
+	Times               int
+	RoleARN             string
+	PromPortLabel       string
+	PromPathLabel       string
+	PromFilterLabel     string
+	PromServerNameLabel string
+	PromJobNameLabel    string
 }
 
-var cluster = flag.String("config.cluster", "", "name of the cluster to scrape")
-var outFile = flag.String("config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
-var interval = flag.Duration("config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
-var times = flag.Int("config.scrape-times", 0, "how many times to scrape before exiting (0 = infinite)")
-var roleArn = flag.String("config.role-arn", "", "ARN of the role to assume when scraping the AWS API (optional)")
-var prometheusPortLabel = flag.String("config.port-label", "PROMETHEUS_EXPORTER_PORT", "Docker label to define the scrape port of the application (if missing an application won't be scraped)")
-var prometheusPathLabel = flag.String("config.path-label", "PROMETHEUS_EXPORTER_PATH", "Docker label to define the scrape path of the application")
-var prometheusFilterLabel = flag.String("config.filter-label", "", "Docker label (and optionally value) to require to scrape the application")
-var prometheusServerNameLabel = flag.String("config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
-var prometheusJobNameLabel = flag.String("config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
+// Register register flags
+func (c *Config) Register(fs *flag.FlagSet) {
+	fs.StringVar(&c.Cluster, "config.cluster", "", "name of the cluster to scrape")
+	fs.StringVar(&c.Outfile, "config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
+	fs.DurationVar(&c.Interval, "config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
+	fs.IntVar(&c.Times, "config.scrape-times", 0, "how many times to scrape before exiting (0, )")
+	fs.StringVar(&c.RoleARN, "config.role-arn", "", "ARN of the role to assume when scraping the AWS API (optional)")
+	fs.StringVar(&c.PromPortLabel, "config.port-label", "PROMETHEUS_EXPORTER_PORT", "Docker label to define the scrape port of the application (if missing an application won't be scraped)")
+	fs.StringVar(&c.PromPathLabel, "config.path-label", "PROMETHEUS_EXPORTER_PATH", "Docker label to define the scrape path of the application")
+	fs.StringVar(&c.PromFilterLabel, "config.filter-label", "", "Docker label (and optionally value) to require to scrape the application")
+	fs.StringVar(&c.PromServerNameLabel, "config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
+	fs.StringVar(&c.PromJobNameLabel, "config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
+
+}
+
+func main() {
+	var conf Config
+	conf.Register(flag.CommandLine)
+	flag.Parse()
+
+	config, err := external.LoadDefaultAWSConfig()
+	if err != nil {
+		logError(err)
+		return
+	}
+
+	if conf.RoleARN != "" {
+		// Assume role
+		stsSvc := sts.New(config)
+		config.Credentials = stscreds.NewAssumeRoleProvider(stsSvc, conf.RoleARN)
+	}
+
+	// Initialise AWS Service clients
+	svc := ecs.New(config)
+	svcec2 := ec2.New(config)
+
+	work := func() {
+		var clusters *ecs.ListClustersOutput
+
+		if conf.Cluster != "" {
+			res, err := svc.DescribeClustersRequest(&ecs.DescribeClustersInput{
+				Clusters: []string{conf.Cluster},
+			}).Send()
+			if err != nil {
+				logError(err)
+				return
+			}
+
+			if len(res.Clusters) == 0 {
+				logError(fmt.Errorf(
+					"%s cluster not found",
+					ecs.ErrCodeClusterNotFoundException,
+				))
+				return
+			}
+
+			clusters = &ecs.ListClustersOutput{
+				ClusterArns: []string{conf.Cluster},
+			}
+		} else {
+			c, err := GetClusters(svc)
+			if err != nil {
+				logError(err)
+				return
+			}
+			clusters = c
+
+		}
+
+		tasks, err := GetAugmentedTasks(svc, svcec2, StringToStarString(clusters.ClusterArns))
+		if err != nil {
+			logError(err)
+			return
+		}
+		infos := []*PrometheusTaskInfo{}
+		for _, t := range tasks {
+			info := t.ExporterInformation(
+				conf.PromJobNameLabel,
+				conf.PromServerNameLabel,
+				conf.PromPortLabel,
+				conf.PromPathLabel,
+				conf.PromFilterLabel,
+			)
+			infos = append(infos, info...)
+		}
+		m, err := yaml.Marshal(infos)
+		if err != nil {
+			logError(err)
+			return
+		}
+		log.Printf("Writing %d discovered exporters to %s", len(infos), conf.Outfile)
+		err = ioutil.WriteFile(conf.Outfile, m, 0644)
+		if err != nil {
+			logError(err)
+			return
+		}
+	}
+	s := time.NewTimer(1 * time.Millisecond)
+	t := time.NewTicker(conf.Interval)
+	n := conf.Times
+	for {
+		select {
+		case <-s.C:
+		case <-t.C:
+		}
+		work()
+		n = n - 1
+		if conf.Times > 0 && n == 0 {
+			break
+		}
+	}
+}
+
+// Config .
 
 // logError is a convenience function that decodes all possible ECS
 // errors and displays them to standard error.
@@ -123,8 +227,8 @@ type PrometheusContainer struct {
 // PrometheusTaskInfo is the final structure that will be
 // output as a Prometheus file service discovery config.
 type PrometheusTaskInfo struct {
-	Targets []string `yaml:"targets"`
-	Labels  labels   `yaml:"labels"`
+	Targets []string     `yaml:"targets"`
+	Labels  ScrapeLabels `yaml:"labels"`
 }
 
 // ExporterInformation returns a list of []*PrometheusTaskInfo
@@ -153,7 +257,13 @@ type PrometheusTaskInfo struct {
 //                }
 //              ],
 //     ...
-func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
+func (t *AugmentedTask) ExporterInformation(
+	prometheusJobNameLabel string,
+	prometheusServerNameLabel string,
+	prometheusPortLabel string,
+	prometheusPathLabel string,
+	prometheusFilterLabel string,
+) []*PrometheusTaskInfo {
 	ret := []*PrometheusTaskInfo{}
 	var host string
 	var ip string
@@ -178,8 +288,8 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 	}
 
 	var filter []string
-	if *prometheusFilterLabel != "" {
-		filter = strings.Split(*prometheusFilterLabel, "=")
+	if prometheusFilterLabel != "" {
+		filter = strings.Split(prometheusFilterLabel, "=")
 	}
 
 	for _, i := range t.Containers {
@@ -198,7 +308,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			continue
 		}
 
-		v, ok := d.DockerLabels[*prometheusPortLabel]
+		v, ok := d.DockerLabels[prometheusPortLabel]
 		if !ok {
 			// Nope, no Prometheus-exported port in this container def.
 			// This container is no good.  We continue.
@@ -243,7 +353,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			hostPort = int64(exporterPort)
 		}
 
-		exporterServerName, ok = d.DockerLabels[*prometheusServerNameLabel]
+		exporterServerName, ok = d.DockerLabels[prometheusServerNameLabel]
 		if ok {
 			host = strings.TrimRight(exporterServerName, "/")
 		} else {
@@ -251,10 +361,10 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			host = ip
 		}
 
-		labels := labels{
+		labels := ScrapeLabels{
 			TaskArn:       *t.TaskArn,
 			TaskName:      *t.TaskDefinition.Family,
-			JobName:       d.DockerLabels[*prometheusJobNameLabel],
+			JobName:       d.DockerLabels[prometheusJobNameLabel],
 			TaskRevision:  fmt.Sprintf("%d", *t.TaskDefinition.Revision),
 			TaskGroup:     *t.Group,
 			ClusterArn:    *t.ClusterArn,
@@ -263,7 +373,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			DockerImage:   *d.Image,
 		}
 
-		exporterPath, ok = d.DockerLabels[*prometheusPathLabel]
+		exporterPath, ok = d.DockerLabels[prometheusPathLabel]
 		if ok {
 			labels.MetricsPath = exporterPath
 		}
@@ -573,92 +683,15 @@ func GetAugmentedTasks(svc *ecs.ECS, svcec2 *ec2.EC2, clusterArns []*string) ([]
 	return tasks, nil
 }
 
-func main() {
-	flag.Parse()
-
-	config, err := external.LoadDefaultAWSConfig()
-	if err != nil {
-		logError(err)
-		return
-	}
-
-	if *roleArn != "" {
-		// Assume role
-		stsSvc := sts.New(config)
-		config.Credentials = stscreds.NewAssumeRoleProvider(stsSvc, *roleArn)
-	}
-
-	// Initialise AWS Service clients
-	svc := ecs.New(config)
-	svcec2 := ec2.New(config)
-
-	work := func() {
-		var clusters *ecs.ListClustersOutput
-
-		if *cluster != "" {
-			res, err := svc.DescribeClustersRequest(&ecs.DescribeClustersInput{
-				Clusters: []string{*cluster},
-			}).Send()
-			if err != nil {
-				logError(err)
-				return
-			}
-
-			if len(res.Clusters) == 0 {
-				logError(fmt.Errorf(
-					"%s cluster not found",
-					ecs.ErrCodeClusterNotFoundException,
-				))
-				return
-			}
-
-			clusters = &ecs.ListClustersOutput{
-				ClusterArns: []string{*cluster},
-			}
-		} else {
-			c, err := GetClusters(svc)
-			if err != nil {
-				logError(err)
-				return
-			}
-			clusters = c
-
-		}
-
-		tasks, err := GetAugmentedTasks(svc, svcec2, StringToStarString(clusters.ClusterArns))
-		if err != nil {
-			logError(err)
-			return
-		}
-		infos := []*PrometheusTaskInfo{}
-		for _, t := range tasks {
-			info := t.ExporterInformation()
-			infos = append(infos, info...)
-		}
-		m, err := yaml.Marshal(infos)
-		if err != nil {
-			logError(err)
-			return
-		}
-		log.Printf("Writing %d discovered exporters to %s", len(infos), *outFile)
-		err = ioutil.WriteFile(*outFile, m, 0644)
-		if err != nil {
-			logError(err)
-			return
-		}
-	}
-	s := time.NewTimer(1 * time.Millisecond)
-	t := time.NewTicker(*interval)
-	n := *times
-	for {
-		select {
-		case <-s.C:
-		case <-t.C:
-		}
-		work()
-		n = n - 1
-		if *times > 0 && n == 0 {
-			break
-		}
-	}
+type ScrapeLabels struct {
+	TaskArn       string `yaml:"task_arn"`
+	TaskName      string `yaml:"task_name"`
+	JobName       string `yaml:"job,omitempty"`
+	TaskRevision  string `yaml:"task_revision"`
+	TaskGroup     string `yaml:"task_group"`
+	ClusterArn    string `yaml:"cluster_arn"`
+	ContainerName string `yaml:"container_name"`
+	ContainerArn  string `yaml:"container_arn"`
+	DockerImage   string `yaml:"docker_image"`
+	MetricsPath   string `yaml:"__metrics_path__,omitempty"`
 }
